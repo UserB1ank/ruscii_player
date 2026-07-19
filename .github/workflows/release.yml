@@ -1,0 +1,173 @@
+name: Release
+
+# 手动触发:在 Actions → Release → Run workflow 里输入版本号即可发布
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0), no leading "v"'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+# release job 需要 write 权限来创建 tag 和上传资源
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: ruscii_player-linux-x86_64
+            archive_ext: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: ruscii_player-macos-x86_64
+            archive_ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: ruscii_player-macos-arm64
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ruscii_player-windows-x86_64
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ matrix.target }}-
+
+      # ── Linux: apt 装系统 FFmpeg dev libs ──────────────────────────────
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libavdevice-dev libavfilter-dev \
+            libswscale-dev libswresample-dev \
+            pkg-config
+
+      # ── macOS: brew 装 FFmpeg (含 shared libs + headers) ────────────────
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      # ── Windows: vcpkg 编译 FFmpeg (慢,但有 binary cache 加速) ─────────
+      - name: Set up MSVC dev cmd
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install FFmpeg via vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: f7423ee180c4b7f40d43402c2feb3859161ef525
+          vcpkgJson: |
+            {
+              "name": "ruscii-player",
+              "version-string": "${{ inputs.version }}",
+              "dependencies": ["ffmpeg"]
+            }
+
+      - name: Build
+        env:
+          # Windows 上让 ffmpeg-next 找到 vcpkg 安装的 FFmpeg
+          FFMPEG_DIR: ${{ runner.os == 'Windows' && format('{0}/vcpkg_installed/x64-windows', github.workspace) || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # ── 打包 (Unix) ────────────────────────────────────────────────────
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir staging
+          cp target/${{ matrix.target }}/release/ruscii_player staging/
+          tar -czf ${{ matrix.artifact }}.tar.gz -C staging ruscii_player
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      # ── 打包 (Windows):同时拷贝 FFmpeg 的 DLL,否则用户机器上跑不起来 ─
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/ruscii_player.exe staging/
+          # 把 FFmpeg shared DLLs 一起打包,这样下载解压即用
+          $dllDir = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
+          if (Test-Path $dllDir) {
+            Copy-Item "$dllDir/*.dll" staging/
+          }
+          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.artifact }}.zip
+          (Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower() | `
+            Out-File -Encoding ascii -NoNewline ${{ matrix.artifact }}.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            ## Downloads · 下载
+
+            | Platform | File |
+            |----------|------|
+            | Linux x86_64 | `ruscii_player-linux-x86_64.tar.gz` |
+            | macOS (Intel) | `ruscii_player-macos-x86_64.tar.gz` |
+            | macOS (Apple Silicon) | `ruscii_player-macos-arm64.tar.gz` |
+            | Windows x86_64 | `ruscii_player-windows-x86_64.zip` |
+
+            > Windows 用户:zip 包内已附带 FFmpeg 的 DLL,解压即可运行,无需另装 FFmpeg。
+            >
+            > Windows users: FFmpeg DLLs are bundled in the zip — just extract and run.
+
+            ---
+
+            ### Changes · 更新内容
+          files: |
+            artifacts/*
+```
